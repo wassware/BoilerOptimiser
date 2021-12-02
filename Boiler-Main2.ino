@@ -70,9 +70,11 @@ OneWire ds(oneWireBus);
 // Pass our oneWire reference to Dallas Temperature sensor
 DallasTemperature sensors(&ds);
 // data
-const int SENSORMAPCOUNT = 5;    // temperature by userid - handle up to this many
+const int SENSORMAPCOUNT = 2;    // temperature by userid - handle up to this many
 int sensorMapping[SENSORMAPCOUNT];
 float temperatures[SENSORMAPCOUNT];
+const int dsRetries = 4;
+int dsErrorCount[dsRetries];               // count errors at retry level
 // --------- dallas/onwire end --------------
 
 // --------- LCD config------------------
@@ -117,59 +119,93 @@ boolean prevChDemand = false;         // ch demand from ch stats
 boolean prevHwDemand = false;         // hw demand from hw stats
 // ----- i2c control end -------------
 
-// config data from eeprom - use int array
-const int configSize = 21;
-int configArr[configSize];
-const int annaLowIx = 0;
-const int annaHighIx = 1;
-const int annaHystIx = 2;          // drop under on level for off
-const int annaSamplesIx = 3;         // min readings over or under for switch
-const int annaChangeIntervalIx = 4;   // limit frequence of change (s)
-const int thermostatLowIx = 5;
-const int thermostatHighIx = 6;
-const int thermostatHwIx = 7;
-const int thermostatHystIx = 8;
-const int anticycleOnOnIx = 9;
-const int anticycleOffOnIx = 10;
-const int rateAdjustIx = 11;
-const int shutdownTempIx = 12;
-const int boilerOffDelayIx = 13;
-const int hwPumpHystIx = 14;
-const int autoRestartHoursIx = 15;
-const int selfTestIx = 16;
-const int cpuFreqIx = 17;           //1=40, 2=80, 3=160, 4=240
-const int btNameIx = 18;           //- appends -n to nale
-const int dsResolutionIx = 19;     //- ds resolution request
-const int dsErrWarnLevelIx = 20;
+const int maxThermostatSamples = 32;
 
-// first 2 chars = code key
-const String configNames[configSize] = {
-  "al-analogLow     ",
-  "ah-analogHigh    ",
-  "ay-analogHyst    ",
-  "as-analogSamples ",
-  "ai-analogChgIntvl",
-  "tl-thermostatLow ",
-  "th-thermostatHigh",
-  "tw-thermostatHW  ",
-  "ty-thermostatHyst",
-  "a1-anticycleOnOn ",
-  "a2-anticycleOffOn",
-  "ra-rateAdjust    ",
-  "st-shutdownTemp  ",
-  "od-boileroffdelay",
-  "hh-hwPumpHyst    ",
-  "ar-autoRestartHrs",
-  "tm-testmode<>0   ",
-  "cf-clockfreq     ",
-  "bt-bluetooth-n   ",
-  "tr-dsresln 9-12  ",
-  "dw-ds err level  ",  // 
+struct ConfigItem
+{
+  public:
+  String name;
+  String code;
+  int value;
+  int defValue;
+  int minValue;
+  int maxValue;
 };
-const int configMin[configSize]   = { 0,  50,  1,  1,  5, 40, 50, 50, 1,  30, 10,  0, 20, 0,  0,   1, 0, 1, 0,  9 , 1 }; 
-const int configMax[configSize]   = {50, 100, 10, 10, 60, 60, 70, 60, 7, 180, 60, 30, 50, 5, 10, 100, 5, 4, 9, 12 , 5 }; 
-const int configReset[configSize] = { 5,  75,  2, 10, 30, 50, 65, 60, 4, 120, 30, 20, 45, 3,  3,  24, 0, 2, 0, 12 , 1 };
-String configCodes[configSize];
+const int configSize = 21;
+ConfigItem configArr[configSize];// =  {{"aa","aa-name",5,5,2,10},{"bb","bb-name",5,5,2,10}};
+
+void addToConfig(int ix, String codex, String namex, int minValuex, int defValuex, int maxValuex)
+{
+  if (ix >= configSize)
+  {
+    log("!!config full at " + namex);
+    return;
+  }
+  for (int ixx = 0; ixx < configSize; ixx++)
+  {
+    if (configArr[ixx].code == codex)
+    {
+      log("!!duplicate config code: " + codex);
+    }
+  }
+  configArr[ix].name = namex;
+  configArr[ix].code = codex;
+  configArr[ix].value = defValuex;
+  configArr[ix].defValue = defValuex;
+  configArr[ix].minValue = minValuex;
+  configArr[ix].maxValue = maxValuex;
+}
+// config data from eeprom - use int array
+
+//int configArr[configSize];
+int annaLowIx = -1;
+int annaHighIx = -1;
+int annaHystIx = -1;             // drop under on level for off
+int annaChangeIntervalIx = -1;   // limit frequence of change (s)
+int thermostatSamplesIx = -1;    // samples used to define temp rate
+int thermostatLowIx = -1;
+int thermostatHighIx = -1;
+int thermostatHwIx = -1;
+int thermostatHystIx = -1;
+int anticycleOnOnIx = -1;
+int anticycleOffOnIx = -1;
+int rateAdjustIx = -1;
+int shutdownTempIx = -1;
+int boilerOffDelayIx = -1;
+int hwPumpHystIx = -1;
+int autoRestartHoursIx = -1;
+int selfTestIx = -1;
+int cpuFreqIx = -1;           //1=40, 2=80, 3=160, 4=240
+int btNameIx = -1;           //- appends -n to nale
+//int dsResolutionIx = -1;     //- ds resolution request
+int dsErrWarnLevelIx = -1;
+
+void InitConfig()
+{
+  int ix = 0;
+  annaLowIx = ix++;  addToConfig(annaLowIx, "al", "analogLow", 0,5,50);
+  annaHighIx = ix++; addToConfig(annaHighIx, "ah", "analogHigh", 50,75,100);
+  annaHystIx = ix++;  addToConfig(annaHystIx, "ay", "analogHyst", 0, 2, 10);
+  annaChangeIntervalIx = ix++;  addToConfig(annaChangeIntervalIx, "ai", "analogChgIntvl", 0, 30, 120);
+  thermostatSamplesIx = ix++;  addToConfig(thermostatSamplesIx, "ts", "thermostatSamples", 4, 12, maxThermostatSamples);
+  thermostatLowIx = ix++;  addToConfig(thermostatLowIx, "tl", "thermostatLow", 40, 50, 60);
+  thermostatHighIx = ix++;  addToConfig(thermostatHighIx, "th", "thermostatHigh", 60, 65, 70);
+  thermostatHwIx = ix++;  addToConfig(thermostatHwIx, "tw", "thermostatHW", 55, 60, 70);
+  thermostatHystIx = ix++;  addToConfig(thermostatHystIx, "ty", "thermostatHyst", 0, 4, 10);
+  anticycleOnOnIx = ix++;  addToConfig(anticycleOnOnIx, "a1", "anticycleOnOn", 30, 120, 180);
+  anticycleOffOnIx = ix++;  addToConfig(anticycleOffOnIx, "a2", "anticycleOffOn", 15, 30, 120);
+  rateAdjustIx = ix++;  addToConfig(rateAdjustIx, "ra", "rateAdjust", 0, 25, 50);
+  shutdownTempIx = ix++;  addToConfig(shutdownTempIx, "st", "shutdownTemp", 40, 45, 60);
+  boilerOffDelayIx = ix++;  addToConfig(boilerOffDelayIx, "od", "boileroffdelay", 0, 20, 30);
+  hwPumpHystIx = ix++;  addToConfig(hwPumpHystIx, "hy", "hwPumpHyst", 0, 2, 5);
+  autoRestartHoursIx = ix++;  addToConfig(autoRestartHoursIx, "ar", "autoRestartHrs", 1, 24, 1000);
+  selfTestIx = ix++;  addToConfig(selfTestIx, "tt", "selfTest", 0, 0, 2);
+  cpuFreqIx = ix++;  addToConfig(cpuFreqIx, "cf", "cpuFreq", 1, 4, 4);
+  btNameIx = ix++;  addToConfig(btNameIx, "bt", "btName", 0, 1, 9);
+  //dsResolutionIx = ix++;  addToConfig(dsResolutionIx, "dr", "dsRes9-12", 9, 12, 12);
+  dsErrWarnLevelIx = ix++;  addToConfig(dsErrWarnLevelIx, "de", "dsErrlevel", 0, 1, 5);
+  log("config items = " + String(ix) + " / " + String(configSize));
+}
 
 // state engine - we have 6 states:
 // 1 - off - action disabled - outputs off, but monitoring
@@ -203,35 +239,36 @@ String controlStateS(int state)
 }
 
 // globals
-unsigned int elapsedMillis = 0;
+unsigned long elapsedMillis = 0;
 const char C = ',';
-unsigned int nextMillis;      // used to synch main loop to 1 sec
-int sNow;                     // seconds since restart from Millis() - used for all timing
+unsigned long nextMillis;      // used to synch main loop to 1 sec
+unsigned long sNow;                     // seconds since restart from Millis() - used for all timing
 String prevLcdRow[] = {"","","",""};   // previously displays lcd data row by row
-const int BOILERTEMPSSIZE = 5;
-float boilertemps[BOILERTEMPSSIZE];  // keep last N temps - [0] is latst
+float boilertemps[maxThermostatSamples];  // keep last N temps for rate adjustment
 float adjustedBoilerTemp;     // after rate adjustment
 float boilerTempAdjustment;   // the adjustment made
 float highestBoilerTemp;      // max temp since last log
 float lowestBoilerTemp;       // min temp since last log
-int boilerOnElapsed;          // boiler on to off time
-int lastBoilerOnAt;           // when last turn on
-int boilerOffElapsed;         // boiler off to on time
-int lastBoilerOffAt;          // last turn off
+unsigned long boilerOnElapsed;          // boiler on to off time
+unsigned long lastBoilerOnAt;           // when last turn on
+unsigned long boilerOffElapsed;         // boiler off to on time
+unsigned long lastBoilerOffAt;          // last turn off
 float dutyCycle = 0;          // on / (on + off)%
-int nextBoilerOnAt;           // used specifically for anti cycle - earliest allowable on
+unsigned long nextBoilerOnAt;           // used specifically for anti cycle - earliest allowable on
 bool breakShutdownCycle = false;  // if we get trigger of boiler on in shotdown
 bool shutdownChValve = false;     // if we include ch valve in shutdown
 byte lastInputs = 0;          // last PFC read
 // analog input processing
-int annaChangeAt = 0;         // when can next switch CH from Tado signal
-int annaValues[10];           // must be >= annaSamples Max - raw values from ADC
+unsigned long annaChangeAt = 0;         // when can next switch CH from Tado signal
+const int annaSampleSize = 10;            // size of averaging ring buffer
+int annaValues[annaSampleSize];           // ring bufer for average
+int annaValuesPtr = 0;                     // pointer into it
 float annaAverage = 0;        // average value used as 0-100
 float boilerOffTemp = 0;      // boiler demand temp C - tirn off point
 float boilerOnTemp = 0;       // boiler demand temp C - turn on point
 
 // demand log variables
-int nextDemandLogAt = 10;
+unsigned long nextDemandLogAt = 10;
 float lastLogAnnaAverage = 0;
 bool logHwDemandAs = false;
 bool logChDemandAs = false;
@@ -255,7 +292,7 @@ bool stActive = false;
 int lastStConfig = 0;
 
 int stControl = 0;     // tado analog
-int stTimer;
+unsigned long stTimer;
 float stAnnaValue = 0;
 float stAnnaMax = 0;
 
@@ -263,7 +300,7 @@ bool stExtChDemand = false;  // keep false
 bool stTempLowLimit = false;
 
 int stHwControl = 0;  // HW
-int stHwTimer;
+unsigned long stHwTimer;
 bool stExtHwDemand = false;
 
 float stTemp = 20;   // boiler temp
@@ -273,7 +310,7 @@ void resetConfig()
   cmdlog("resetting config");
   for (int ix = 0; ix < configSize ; ix++)
   {
-    configArr[ix] = configReset[ix];
+    configArr[ix].value = configArr[ix].defValue;
   }
   logConfig();
 }
@@ -287,12 +324,12 @@ float randomF(float v1, float v2)
 void selfTest()
 {
   bool initMe = false;
-  if (lastStConfig != configArr[selfTestIx])
+  if (lastStConfig != configArr[selfTestIx].value)
   {
-    lastStConfig = configArr[selfTestIx];
+    lastStConfig = configArr[selfTestIx].value;
     initMe = true;
   }
-  switch (configArr[selfTestIx])
+  switch (configArr[selfTestIx].value)
   {
     case 1:
       stActive = true;
@@ -317,8 +354,8 @@ void selfTest1(bool initMe)
   if (initMe)
   {
     demandLogInterval = 10;
-    configArr[anticycleOnOnIx] = 20;
-    configArr[anticycleOffOnIx] = 10;
+    configArr[anticycleOnOnIx].value = 20;
+    configArr[anticycleOffOnIx].value = 10;
   }
   int t;
   switch (stHwControl)
@@ -435,8 +472,8 @@ void selfTest2(bool initMe)
   if (initMe)
   {
     demandLogInterval = 10;
-    configArr[anticycleOnOnIx] = 20;
-    configArr[anticycleOffOnIx] = 10;
+    configArr[anticycleOnOnIx].value = 20;
+    configArr[anticycleOffOnIx].value = 10;
     stControl = 0;
   }
   int t;
@@ -548,7 +585,15 @@ void log(String s)    // default to mainlogfile
 
 void logIx(int ix, String s)
 {
-  String ss = "f:" + String(ix) + C + s;
+  String ss;
+  if (ix == CMDLOGFILE)
+  {
+    ss = "f:" + String(ix) + C + s;    // commands - ignore time
+  }
+  else
+  {
+    ss = "f:" + String(ix) + C + String(sNow) + C  + s;    // loggging - add time
+  }
   Serial.println(ss);
 #ifdef USEBT  
   if (SerialBT.hasClient())
@@ -618,9 +663,26 @@ void demandLog()
 
 void logConfig()
 {
+  int maxLen = 0;
   for (int ix = 0; ix < configSize; ix++)
   {
-    cmdlog(configNames[ix] + " = " + String(configArr[ix]));
+    if (configArr[ix].name.length() > maxLen)
+    {
+      maxLen = configArr[ix].name.length();
+    }
+  }
+  for (int ix = 0; ix < configSize; ix++)
+  {
+    if (configArr[ix].code != "")
+    {
+    int padd = maxLen - configArr[ix].name.length();
+    String s = "";
+    for (int ip = 0; ip < padd; ip++)
+    {
+      s += ".";
+    }
+    cmdlog(configArr[ix].code + "-" + configArr[ix].name + s + " = " + String(configArr[ix].value) + "  (" + String(configArr[ix].minValue)+ " -" + String(configArr[ix].maxValue) + ")");
+    }
   }
 }
 
@@ -629,8 +691,8 @@ void saveToEprom()
   int im = 0;
   for (int ix = 0; ix < configSize; ix++)
   {
-    EEPROM.write(im++, highByte(configArr[ix]));
-    EEPROM.write(im++, lowByte(configArr[ix]));
+    EEPROM.write(im++, highByte(configArr[ix].value));
+    EEPROM.write(im++, lowByte(configArr[ix].value));
   }
   EEPROM.commit();
   cmdlog("EEPROM save:");
@@ -642,10 +704,10 @@ void loadFromEprom()
   int im = 0;
   for (int ix = 0; ix < configSize; ix++)
   {
-    configArr[ix] =  word( EEPROM.read(im++), EEPROM.read(im++));
-    if (configArr[ix] < configMin[ix] || configArr[ix] > configMax[ix])
+    configArr[ix].value =  word( EEPROM.read(im++), EEPROM.read(im++));
+    if (configArr[ix].value < configArr[ix].minValue || configArr[ix].value > configArr[ix].maxValue)
     {
-      configArr[ix] = configReset[ix];
+      configArr[ix].value = configArr[ix].defValue;
     }
   }
   cmdlog("EEPROM load:");
@@ -667,18 +729,18 @@ void handleMapSensors()
   }
   int ix = buffer[1]-48;
   int ud = buffer[2]-48;
-  for (int it = 1; it < 5; it++)
+  for (int it = 1; it <= dsRetries; it++)
   {
     sensors.setUserDataByIndex(ix, ud);
     int cud = sensors.getUserDataByIndex(ix);
     if (cud == ud)
     {
-      log("ix=" + String(ix) + " ud change " + String(cud) + " > " + String(cud)); 
+      cmdlog("ix=" + String(ix) + " ud change " + String(cud) + " > " + String(cud)); 
       break;
     }
     else
     {
-      log("!! ix=" + String(ix) + " set ud fail: " + String(ud) + " != " + String(cud) + " x" + String(ix)); 
+      cmdlog("!! ix=" + String(ix) + " set ud fail: " + String(ud) + " != " + String(cud) + " x" + String(ix)); 
       delay(10);
     } 
   }
@@ -697,7 +759,7 @@ void mapSensors()
   for (int ix = 0; ix < sensors.getDeviceCount(); ix++)
   {
     int ud;
-    for (int it = 1; it < 4; it++)
+    for (int it = 1; it <= dsRetries; it++)
     {
       int ud1 = sensors.getUserDataByIndex(ix);
       delay(10);
@@ -708,6 +770,7 @@ void mapSensors()
         break;
       }
       log("!! ix=" + String(ix) + " retry get ud x" + String(it));
+      dsErrorCount[it-1]++;
     }
     String info = "ix:" + String(ix) + ", t=" + String(sensors.getTempCByIndex(ix)) + ", ud=" + String(ud) + ", ";
 
@@ -733,11 +796,13 @@ void mapSensors()
 // does the temp reading and store
 void getTemperatures()
 {
+  // try start with 10ms delay
+  delay(10);
   for (int ix = 0; ix < SENSORMAPCOUNT; ix++)
   {
     if (sensorMapping[ix] >= 0 && sensorMapping[ix] < SENSORMAPCOUNT)
     {
-      for (int it = 1; it < 4; it++)
+      for (int it = 1; it <= dsRetries; it++)
       {
         temperatures[ix] = sensors.getTempCByIndex(sensorMapping[ix]);
         if (temperatures[ix] != -127.0)
@@ -746,9 +811,10 @@ void getTemperatures()
         }
         else
         {
-          if (it >= configArr[dsErrWarnLevelIx])    // maybe count as well
+          if (it >= configArr[dsErrWarnLevelIx].value)    // maybe count as well
           {
             log("!! ds read error ix=" + String(ix) + " x" + String(it));
+            dsErrorCount[it-1]++;
           }
           delay(10);
         }
@@ -886,7 +952,7 @@ void display1()
   switch (controlState)
   {
     case CONTROLSSHUTDOWN:
-      s += formatInt(configArr[shutdownTempIx], 2) + " s ";
+      s += formatInt(configArr[shutdownTempIx].value, 2) + " s ";
       break;
     case CONTROLSCOOLING:
       s += formatInt(boilerOnTemp, 2) + " < ";
@@ -983,24 +1049,27 @@ void display5()
 void readTadoAnalog()
 {
   // take average of last sample values as raw analogue (0-4095)
-  long annaTotal = 0;
-  for (int ix = configArr[annaSamplesIx] - 1; ix >= 1; ix--)
+  annaValuesPtr++;
+  if (annaValuesPtr > annaSampleSize)
   {
-    // shift down and add up
-    annaValues[ix] = annaValues[ix - 1];
-    annaTotal += annaValues[ix];
+    annaValuesPtr = 0;
   }
-  annaValues[0] = analogRead(analogPin); // take current value
+  annaValues[annaValuesPtr] = analogRead(analogPin); // take current value
   if (stActive)  // override if self test
   {
     annaValues[0] = stAnnaValue * 4096 / 100;
   }
-  annaTotal += annaValues[0];
-  // find average - drop sample most away from average
-  int tempAverage = annaTotal / configArr[annaSamplesIx];
+  // compute average
+  long annaTotal = 0;
+  for (int ix = 0 ; ix < annaSampleSize; ix++)
+  {
+    annaTotal += annaValues[ix];
+  }
+  int tempAverage = annaTotal / annaSampleSize;
+  // drop sample most away from average
   int dropIx = 0;
   int maxDiff = 0;
-  for (int ix = 0; ix < configArr[annaSamplesIx]; ix++)
+  for (int ix = 0; ix < annaSampleSize; ix++)
   {
     if (abs(annaValues[ix] - annaAverage) > maxDiff)
     {
@@ -1010,20 +1079,20 @@ void readTadoAnalog()
   }
   // take new average from remaining 9 scaled 0-100
   annaTotal -= annaValues[dropIx];
-  annaAverage = annaTotal / (configArr[annaSamplesIx] - 1) * 100.0 / 4096.0;
+  annaAverage = annaTotal / (annaSampleSize - 1) * 100.0 / 4096.0;
 
   // determine if chdemand on or off - allow for min switching interval && hysterisis
   if (controlState == CONTROLSOFF)
   {
     chDemand = false;
   }
-  else if (annaAverage >= configArr[annaLowIx])
+  else if (annaAverage >= configArr[annaLowIx].value)
   {
     if (!chDemand)
     {
       if (sNow >= annaChangeAt)
       {
-        annaChangeAt = sNow + configArr[annaChangeIntervalIx];
+        annaChangeAt = sNow + configArr[annaChangeIntervalIx].value;
         chDemand = true;
         log("TadoCH > ON");
       }
@@ -1033,13 +1102,13 @@ void readTadoAnalog()
       //      }
     }
   }
-  else if (annaAverage < configArr[annaLowIx] - configArr[annaHystIx])
+  else if (annaAverage < configArr[annaLowIx].value - configArr[annaHystIx].value)
   {
     if (chDemand)
     {
       if (sNow >= annaChangeAt)
       {
-        annaChangeAt = sNow + configArr[annaChangeIntervalIx];
+        annaChangeAt = sNow + configArr[annaChangeIntervalIx].value;
         chDemand = false;
         log("TadoCH > OFF");
       }
@@ -1050,15 +1119,15 @@ void readTadoAnalog()
     }
   }
   // determine demand boiler temp
-  float temp = (annaAverage - configArr[annaLowIx]) / (configArr[annaHighIx] -  configArr[annaLowIx]) *
-               (configArr[thermostatHighIx] - configArr[thermostatLowIx]) +  configArr[thermostatLowIx];
-  boilerOffTemp = constrain(temp, configArr[thermostatLowIx], configArr[thermostatHighIx]);
+  float temp = (annaAverage - configArr[annaLowIx].value) / (configArr[annaHighIx].value -  configArr[annaLowIx].value) *
+               (configArr[thermostatHighIx].value - configArr[thermostatLowIx].value) +  configArr[thermostatLowIx].value;
+  boilerOffTemp = constrain(temp, configArr[thermostatLowIx].value, configArr[thermostatHighIx].value);
   // if HW demand must be sufficient for HW
   if (hwDemand)
   {
-    boilerOffTemp = constrain(temp, configArr[thermostatHwIx], configArr[thermostatHighIx]);
+    boilerOffTemp = constrain(temp, configArr[thermostatHwIx].value, configArr[thermostatHighIx].value);
   }
-  boilerOnTemp = boilerOffTemp - configArr[thermostatHystIx];
+  boilerOnTemp = boilerOffTemp - configArr[thermostatHystIx].value;
 }
 
 void readHWTemp()
@@ -1071,16 +1140,16 @@ void calculate()
   bool logged = false;
 
   // shift history down temp array
-  for (int ix = 1; ix < BOILERTEMPSSIZE; ix++)
+  int samples = configArr[thermostatSamplesIx].value;
+  for (int ix = samples-1; ix >= 1; ix--)
   {
     boilertemps[ix] = boilertemps[ix - 1];
   }
   boilertemps[0] = temperatures[0];
 
-  // rate is between avg last 2 and avg prev 2
-  float change = ((boilertemps[0] + boilertemps[1]) / 2 - (boilertemps[2] + boilertemps[3]) / 2);
-  float rate = change / 2;    // as sample interval is 2 secs
-  boilerTempAdjustment = rate * configArr[rateAdjustIx];
+  // rate is between avg first 2 and avg last 2 - therefore over (samples-2) seconds
+  float rate = (boilertemps[0] + boilertemps[1] - boilertemps[samples-2] - boilertemps[samples-1]) / float((samples-2) * 2);
+  boilerTempAdjustment = rate * float(configArr[rateAdjustIx].value);
   adjustedBoilerTemp = boilertemps[0] + boilerTempAdjustment;
 
   // track high/low
@@ -1131,7 +1200,7 @@ void calculate()
     if (!chDemand && !hwDemand && (prevChDemand || prevHwDemand) && !setBoilerOff)
     {
       boilerOnElapsed =   sNow - lastBoilerOnAt;
-      nextBoilerOnAt = max(nextBoilerOnAt, sNow + configArr[anticycleOffOnIx]);
+      nextBoilerOnAt = max(nextBoilerOnAt, sNow + configArr[anticycleOffOnIx].value);
       lastBoilerOffAt = sNow;
       int fullcyclesec = (boilerOffElapsed + boilerOnElapsed);
       if (fullcyclesec > 0)
@@ -1149,7 +1218,7 @@ void calculate()
         
     }
     setHwPumpOn = false;
-    if (boilertemps[0] > configArr[shutdownTempIx] && !breakShutdownCycle)
+    if (boilertemps[0] > configArr[shutdownTempIx].value && !breakShutdownCycle)
     {
       if (tempLowLimit)
       {
@@ -1212,7 +1281,7 @@ void calculate()
           controlState = CONTROLSHEATING;
           setBoilerOff = false;
           lastBoilerOnAt = sNow;
-          nextBoilerOnAt =  max(nextBoilerOnAt, sNow + configArr[anticycleOnOnIx]);
+          nextBoilerOnAt =  max(nextBoilerOnAt, sNow + configArr[anticycleOnOnIx].value);
           int fullcyclesec = (boilerOffElapsed + boilerOnElapsed);
           if (fullcyclesec > 0)
           {
@@ -1244,7 +1313,7 @@ void calculate()
         // boiler off
         controlState = CONTROLSCOOLING;
         setBoilerOff = true;
-        nextBoilerOnAt = max(nextBoilerOnAt, sNow + configArr[anticycleOffOnIx]);
+        nextBoilerOnAt = max(nextBoilerOnAt, sNow + configArr[anticycleOffOnIx].value);
         lastBoilerOffAt = sNow;
         int fullcyclesec = (boilerOffElapsed + boilerOnElapsed);
         if (fullcyclesec > 0)
@@ -1280,11 +1349,12 @@ void calculate()
     }
     else
     {
-      if (adjustedBoilerTemp < boilerOnTemp - configArr[hwPumpHystIx])
+      if (adjustedBoilerTemp < boilerOnTemp - configArr[hwPumpHystIx].value)
       {
         setHwPumpOn = false;
       }
     }
+    setHwPumpOn = false;    // disable for now
   }
 
   if (!logged && controlState != prevControlState)
@@ -1354,7 +1424,7 @@ byte setOutputs2(byte existB)
   {
     if (!chv)
     {
-      boilerOffDelayAt = sNow + configArr[boilerOffDelayIx];
+      boilerOffDelayAt = sNow + configArr[boilerOffDelayIx].value;
     }
     log("CHVALVE > " + onOffS(chv));
     return newB;
@@ -1364,7 +1434,7 @@ byte setOutputs2(byte existB)
   {
     if (!(setHwValveOn))
     {
-      boilerOffDelayAt = sNow + + configArr[boilerOffDelayIx];
+      boilerOffDelayAt = sNow + + configArr[boilerOffDelayIx].value;
     }
     log("HWVALVE > " + onOffS(setHwValveOn));
     return newB;
@@ -1415,7 +1485,7 @@ int lastClockFreq = -1;
 void setClockFreq()
 {
   int freq = 80;
-  switch (configArr[cpuFreqIx])
+  switch (configArr[cpuFreqIx].value)
   {
     case 1:
       freq = 40;
@@ -1452,6 +1522,7 @@ void dohelp()
   cmdlog("b - restart");
   cmdlog("m - show sensor map");
   cmdlog("mnn - change sensor ud");
+  cmdlog("d - diagnostics");
 }
 
 void parseCmd()
@@ -1514,6 +1585,17 @@ void parseCmd()
     case 'm':
       handleMapSensors();
       break;
+
+    case 'd':   //!! redo better
+      {
+        String ss = "DS errors: ";
+        for (int ix = 0; ix < 4; ix++)
+        {
+          ss+= String(dsErrorCount[ix]) + "; ";
+        }
+        cmdlog(ss);
+        break;
+      }
    
     default:
       cmdlog("'" + String(buffer[0]) + "' ??");
@@ -1541,7 +1623,7 @@ void handleConfig()
   int ip = -1;
   for (int ix = 0; ix < configSize; ix++)
   {
-    if (s == configCodes[ix])
+    if (s == configArr[ix].code)
     {
       ip = ix;
       break;
@@ -1555,7 +1637,7 @@ void handleConfig()
   if (bPtr == 3)
   {
     // just show param
-    cmdlog(configCodes[ip] + "=" + String(configArr[ip]));
+    cmdlog(configArr[ip].code + "=" + String(configArr[ip].value));
     return;
   }
   // parse value
@@ -1574,19 +1656,19 @@ void handleConfig()
     }
   }
   // change value
-  if (value > configMax[ip])
+  if (value > configArr[ip].maxValue)
   {
-    cmdlog("!! > " + String(configMax[ip]));
+    cmdlog("!! > " + String(configArr[ip].maxValue));
     return;
   }
-  if (value < configMin[ip])
+  if (value < configArr[ip].minValue)
   {
-    cmdlog("!! < " + String(configMin[ip]));
+    cmdlog("!! < " + String(configArr[ip].minValue));
     return;
   }
-  int prev = configArr[ip];
-  configArr[ip] = value;
-  log(configCodes[ip] + ":" + String(prev) + " > " + String(configArr[ip]));
+  int prev = configArr[ip].value;
+  configArr[ip].value = value;
+  log(configArr[ip].code + ":" + String(prev) + " > " + String(configArr[ip].value));
 }
 
 void setup()
@@ -1594,15 +1676,20 @@ void setup()
   // basics
   Serial.begin(115200);
 
+  // PFC control interface
+  PCF_01.begin(255);  // set all bits on
+  
+  InitConfig();
+
   // init from eprom..
   EEPROM.begin(configSize * 2);
   loadFromEprom();
 
 #ifdef USEBT 
    // bluetooth
-  if (configArr[btNameIx] > 0)
+  if (configArr[btNameIx].value > 0)
   {
-    String actBtName = btName + "-" + String(configArr[btNameIx]);
+    String actBtName = btName + "-" + String(configArr[btNameIx].value);
     log("enable bluetooth - " + actBtName);
     SerialBT.begin(actBtName);
   }
@@ -1613,20 +1700,6 @@ void setup()
 #else
   Serial2.begin(9600);
 #endif
-
-  
-  // config short codes
-  for (int ix = 0; ix < configSize; ix++)
-  {
-    configCodes[ix] = String(configNames[ix][0]) + String(configNames[ix][1]);
-    for (int iy = 0; iy < ix; iy++)
-    {
-      if (configCodes[ix] == configCodes[iy])
-      {
-        log("!!duplicate short code '" + configCodes[iy] + "'");
-      }
-    }
-  }
   
   // log data headers
   for (int ix = 0; ix < NUMLOGFILES; ix++)
@@ -1643,8 +1716,6 @@ void setup()
   esp_task_wdt_init(WDT_TIMEOUT, true); //enable panic so ESP32 restarts
   esp_task_wdt_add(NULL); //add current thread to WDT watch
 
-  
-
   // diagnostic - scan i2c bus
   I2CScan();
 
@@ -1657,37 +1728,44 @@ void setup()
   lcd.print(module);
   lcd.setCursor(0, 1);
   lcd.print(buildDate);
-
+  
   // dallas
-  // for somereason need to do twice - maybe onewire settling down?
-  sensors.begin();
-  log("Dallas sensors1: " + String(sensors.getDeviceCount()));
-  sensors.begin();
-  log("Dallas sensors2: " + String(sensors.getDeviceCount()));
+  // try n times max - should get required devices
+  for (int it=1; it <= dsRetries; it++)
+  {
+    sensors.begin();
+    log("Dallas sensors: " + String(sensors.getDeviceCount()));
+    if (sensors.getDeviceCount() == SENSORMAPCOUNT)
+    {
+      break;
+    }
+    log("!! device count <> " + String(SENSORMAPCOUNT) + " x=" + String(it));
+    dsErrorCount[it-1]++;
+    delay(10);
+  }
   // map userdata to sensor map
-  sensors.setResolution(configArr[dsResolutionIx]);
+  //sensors.setResolution(configArr[dsResolutionIx].value);
   mapSensors();
   lcd.setCursor(0, 2);
   lcd.print("sensors = ");
   lcd.print(sensors.getDeviceCount());
-  sensors.requestTemperatures(); //  wait while get first readings..
+  sensors.setWaitForConversion(false); // we request and ask a second later. takes some 700ms for 12 bit
+  sensors.requestTemperatures(); 
+  delay(1000);                         //  wait while get first readings..
   getTemperatures();
   // initialize
   lastBoilerOnAt = sNow;
   lastBoilerOffAt = sNow;
   highestBoilerTemp = 0;
   lowestBoilerTemp = 100;
-  for (int ix = 0; ix < BOILERTEMPSSIZE; ix++)
+  for (int ix = 0; ix < configArr[thermostatSamplesIx].value; ix++)
   {
     boilertemps[ix] = temperatures[0];
   }
-  sensors.setWaitForConversion(false); // we request and ask a second later. takes some 700ms for 12 bit
+  delay(1000);
   sensors.requestTemperatures();
-
-  // PFC control interface
-  PCF_01.begin(255);  // set all bits on
-
-  delay(2000);
+  
+  delay(1000);
  
 }
 
@@ -1742,22 +1820,23 @@ void loop()
     unsigned int startMillis = millis();
     digitalWrite(ledPin, 1);
     //!!setClockFreq();
-    if (controlState == CONTROLSSTANDBY && sNow > configArr[autoRestartHoursIx] * 3600)
+    if (controlState == CONTROLSSTANDBY && sNow > configArr[autoRestartHoursIx].value * 3600)
     {
       log("scheduled restart..");
 
       ESP.restart();
     }
     // 1 sec processing
+    getTemperatures();
     selfTest();
     readInputs();
-    getTemperatures();
+    //getTemperatures();
     readTadoAnalog();
     readHWTemp(); 
     calculate();
     setOutputs();
     demandLog();
-    sensors.requestTemperatures(); // pick up next pass
+    
     updateDisplay();
     digitalWrite(ledPin, 0);
     elapsedMillis = millis() - startMillis;
@@ -1766,6 +1845,7 @@ void loop()
     prevControlState = controlState;
     prevChDemand = chDemand;
     prevHwDemand = hwDemand;
+    sensors.requestTemperatures(); // pick up next pass
   }
   
   esp_task_wdt_reset();    // tickle watchdog
