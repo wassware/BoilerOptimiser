@@ -18,10 +18,6 @@ const char buildDate[] = __DATE__  "  "  __TIME__;
   void setOutputs(
   void updateDisplay(
   void display1(
-  void display2(
-  void display3(
-  void display4(
-  void display5(
   void log(
   void logConfig(
   void resetConfig(
@@ -38,20 +34,17 @@ const char buildDate[] = __DATE__  "  "  __TIME__;
   void lcdReInit(
   void cycleLog(
   void demandLog(
+  void statusLog(
   void calculate(
 */
 // --------  simple i/o pins -----
 const int ledPin = 2;
 const int analogPin = 36;  // analog input from tado controller - normalised for 0-3.3v range
 
-#define USEBT
-
-#ifdef USEBT 
 //------  bluetooth -------
 #include "BluetoothSerial.h"
 const String btName = "BOILER";     // will append -n from config
 BluetoothSerial SerialBT;
-#endif
 
 // ------------- EEPROM config ---------------
 #include <EEPROM.h>
@@ -102,15 +95,18 @@ const byte HWDEMANDBIT = 5;       // read HW valve state
 const byte TEMPLOLIMBIT  = 6;   // thermostat in state
 const byte READMASK = 0xF0;      // 4 top bits high - must set on write as input
 
-// values to set state
+// values to set outputs
 boolean setBoilerOff = false;
 boolean setChValveOn = false;
 boolean setHwValveOn = false;
 boolean setHwPumpOn = false;
 
-//values from read state
+//values from read state & inputs
+int tadoLevel = 0;                // from tado, 1 = off, 2 = heat dump ok, 3 = chDemand 
+boolean chEnabled = true;          // control to switch CH off - just does HW actions.
 boolean extChDemand = false;      // ch demand from backup stat
 boolean chDemand = false;         // ch demand from analogue
+boolean chDumpOk = false;         // enough ch demand from tado to be worth dumping in shutdown
 boolean extHwDemand = false;      // hw demand from hw stats
 boolean hwDemand = false;         // hw demand from dallas
 boolean tempLowLimit = false;     // kicks on when boiler hits low protect level - overrides setBoilerOff
@@ -131,7 +127,7 @@ struct ConfigItem
   int minValue;
   int maxValue;
 };
-const int configSize = 21;
+const int configSize = 20;
 ConfigItem configArr[configSize];// =  {{"aa","aa-name",5,5,2,10},{"bb","bb-name",5,5,2,10}};
 
 void addToConfig(int ix, String codex, String namex, int minValuex, int defValuex, int maxValuex)
@@ -158,9 +154,10 @@ void addToConfig(int ix, String codex, String namex, int minValuex, int defValue
 // config data from eeprom - use int array
 
 //int configArr[configSize];
-int annaLowIx = -1;
+int annaOffIx = -1;
+int annaChIx = -1;
 int annaHighIx = -1;
-int annaHystIx = -1;             // drop under on level for off
+int annaHystIx = -1;             // hysteresis for analog change
 int annaChangeIntervalIx = -1;   // limit frequence of change (s)
 int thermostatSamplesIx = -1;    // samples used to define temp rate
 int thermostatLowIx = -1;
@@ -175,18 +172,17 @@ int boilerOffDelayIx = -1;
 int hwPumpHystIx = -1;
 int autoRestartHoursIx = -1;
 int selfTestIx = -1;
-int cpuFreqIx = -1;           //1=40, 2=80, 3=160, 4=240
 int btNameIx = -1;           //- appends -n to nale
-//int dsResolutionIx = -1;     //- ds resolution request
 int dsErrWarnLevelIx = -1;
 
 void InitConfig()
 {
   int ix = 0;
-  annaLowIx = ix++;  addToConfig(annaLowIx, "al", "analogLow", 0,5,50);
-  annaHighIx = ix++; addToConfig(annaHighIx, "ah", "analogHigh", 50,75,100);
-  annaHystIx = ix++;  addToConfig(annaHystIx, "ay", "analogHyst", 0, 2, 10);
-  annaChangeIntervalIx = ix++;  addToConfig(annaChangeIntervalIx, "ai", "analogChgIntvl", 0, 30, 120);
+  annaOffIx = ix++;  addToConfig(annaOffIx, "al", "analogOff", 0,3,50);
+  annaChIx = ix++;  addToConfig(annaChIx, "al", "analogCh", 0,10,50);
+  annaHighIx = ix++; addToConfig(annaHighIx, "ah", "analogHigh", 50,80,100);
+  annaHystIx = ix++;  addToConfig(annaHystIx, "ay", "analogHyst", 0, 1, 10);
+  annaChangeIntervalIx = ix++;  addToConfig(annaChangeIntervalIx, "ai", "analogChgIntvl", 0, 60, 180);
   thermostatSamplesIx = ix++;  addToConfig(thermostatSamplesIx, "ts", "thermostatSamples", 4, 12, maxThermostatSamples);
   thermostatLowIx = ix++;  addToConfig(thermostatLowIx, "tl", "thermostatLow", 40, 50, 60);
   thermostatHighIx = ix++;  addToConfig(thermostatHighIx, "th", "thermostatHigh", 60, 65, 70);
@@ -200,35 +196,25 @@ void InitConfig()
   hwPumpHystIx = ix++;  addToConfig(hwPumpHystIx, "hy", "hwPumpHyst", 0, 2, 5);
   autoRestartHoursIx = ix++;  addToConfig(autoRestartHoursIx, "ar", "autoRestartHrs", 1, 24, 1000);
   selfTestIx = ix++;  addToConfig(selfTestIx, "tt", "selfTest", 0, 0, 2);
-  cpuFreqIx = ix++;  addToConfig(cpuFreqIx, "cf", "cpuFreq", 1, 4, 4);
   btNameIx = ix++;  addToConfig(btNameIx, "bt", "btName", 0, 1, 9);
-  //dsResolutionIx = ix++;  addToConfig(dsResolutionIx, "dr", "dsRes9-12", 9, 12, 12);
   dsErrWarnLevelIx = ix++;  addToConfig(dsErrWarnLevelIx, "de", "dsErrlevel", 0, 1, 5);
   log("config items = " + String(ix) + " / " + String(configSize));
 }
 
-// state engine - we have 6 states:
-// 1 - off - action disabled - outputs off, but monitoring
-// 1 - standby - !chDemand && !hwDemand && boiler cool - waiting for on - nothing active
-// 2 - shutdown - !chDemand && !hwDemand && boiler still hot - select either or both
-// 3 - anticycle - chDemand || hwDemand && holding to anticycle
-// 4 - heating  - chDemand || hwDemand && under hightemp
-// 5 - cooling  - chDemand || hwDemand  and cooling to hightemp-hysterisis anticycle delay
 
+// state engine - state enumerations
 int controlState = 0;
-const int CONTROLSOFF = 1;
-const int CONTROLSSTANDBY = 2;
-const int CONTROLSSHUTDOWN = 3;
-const int CONTROLSANTICYCLE = 4;
-const int CONTROLSHEATING = 5;
-const int CONTROLSCOOLING = 6;
+const int CONTROLSSTANDBY = 1;    //standby - !chDemand && !hwDemand && boiler cool - waiting for on - nothing active
+const int CONTROLSSHUTDOWN = 2;   //shutdown - !chDemand && !hwDemand && boiler still hot - select either or both
+const int CONTROLSANTICYCLE = 3;  //anticycle - chDemand || hwDemand && holding to anticycle
+const int CONTROLSHEATING = 4;    //heating  - chDemand || hwDemand && under hightemp
+const int CONTROLSCOOLING = 5;    //cooling  - chDemand || hwDemand  and cooling to hightemp-hysterisis anticycle delay
 
 int prevControlState = 0;
 String controlStateS(int state)
 {
   switch (state)
   {
-    case CONTROLSOFF:       return "off    ";
     case CONTROLSSTANDBY:   return "standby";
     case CONTROLSSHUTDOWN:  return "shutdwn";
     case CONTROLSANTICYCLE: return "anticyc";
@@ -253,19 +239,22 @@ unsigned long boilerOnElapsed;          // boiler on to off time
 unsigned long lastBoilerOnAt;           // when last turn on
 unsigned long boilerOffElapsed;         // boiler off to on time
 unsigned long lastBoilerOffAt;          // last turn off
+unsigned long boilerOffDelayUntil = 0;  // when releasing boiler off - delays for a few secs while valves release
 float dutyCycle = 0;          // on / (on + off)%
 unsigned long nextBoilerOnAt;           // used specifically for anti cycle - earliest allowable on
 bool breakShutdownCycle = false;  // if we get trigger of boiler on in shotdown
-bool shutdownChValve = false;     // if we include ch valve in shutdown
 byte lastInputs = 0;          // last PFC read
 // analog input processing
-unsigned long annaChangeAt = 0;         // when can next switch CH from Tado signal
+unsigned long nextAnnaChange = 0;       // next time we can change Tado demand state - limts change
+int lastTadoLevel = 0;
+int annaHyst = 0;
 const int annaSampleSize = 10;            // size of averaging ring buffer
 int annaValues[annaSampleSize];           // ring bufer for average
 int annaValuesPtr = 0;                     // pointer into it
 float annaAverage = 0;        // average value used as 0-100
 float boilerOffTemp = 0;      // boiler demand temp C - tirn off point
 float boilerOnTemp = 0;       // boiler demand temp C - turn on point
+int sendStatus = 0;         // cmd to send a status output as a status reply each loop - num times
 
 // demand log variables
 unsigned long nextDemandLogAt = 10;
@@ -275,17 +264,19 @@ bool logChDemandAs = false;
 int demandLogInterval = 30;
 
 // log files - referred to by index
-const int NUMLOGFILES = 4;
+const int NUMLOGFILES = 5;
 const int CMDLOGFILE = 0;
 const int MAINLOGFILE = 1;
 const int CYCLELOGFILE = 2;
 const int DEMANDLOGFILE = 3;
+const int STATUSLOGFILE = 4;
 
 String logFileHeaders[] = {
   "cmd",
   "log",
   "ontime,offtime,duty,offtemp,tmax,tmin,chdemand,hwdemand",
-  "tado,offtemp,chdemand,hwdemand"};
+  "tado,offtemp,chdemand,hwdemand",
+  "to-define"};
 
 // test stuff
 bool stActive = false;
@@ -295,14 +286,11 @@ int stControl = 0;     // tado analog
 unsigned long stTimer;
 float stAnnaValue = 0;
 float stAnnaMax = 0;
-
 bool stExtChDemand = false;  // keep false
 bool stTempLowLimit = false;
-
 int stHwControl = 0;  // HW
 unsigned long stHwTimer;
 bool stExtHwDemand = false;
-
 float stTemp = 20;   // boiler temp
 
 void resetConfig()
@@ -586,23 +574,25 @@ void log(String s)    // default to mainlogfile
 void logIx(int ix, String s)
 {
   String ss;
-  if (ix == CMDLOGFILE)
-  {
-    ss = "f:" + String(ix) + C + s;    // commands - ignore time
-  }
-  else
-  {
-    ss = "f:" + String(ix) + C + String(sNow) + C  + s;    // loggging - add time
-  }
+ 
+  ss = "f:" + String(ix) + C + s;    // commands - ignore time
+ 
   Serial.println(ss);
-#ifdef USEBT  
+  Serial2.println(ss);
   if (SerialBT.hasClient())
   {
     SerialBT.println(ss);
   }
-#else
-  Serial2.println(ss);
-#endif
+}
+
+void statusLog()
+{
+  //ontemp,current,deltaadj,offtemp,ontime,offtime,duty,tado,intemp,ch,hw,state
+  String dataline = String(boilerOnTemp) + C + String(boilertemps[0],2) + C + String(boilerTempAdjustment,2) 
+  + C + String(boilerOffTemp) + C + String(boilerOnElapsed) + C + String(boilerOffElapsed)
+  + C + String(dutyCycle,1) + C + String(annaAverage,2) + String(temperatures[1])
+  + C + String(chDemand || setChValveOn) + C + String(hwDemand || setHwValveOn) + C + controlStateS(controlState);
+  logIx(STATUSLOGFILE, dataline);
 }
 
 void cycleLog()   // logs at each boiler off
@@ -652,10 +642,19 @@ void demandLog()
   }
   if (loggIt)
   {
+    float boilerOffTempT = boilerOffTemp;
+    if (controlState == CONTROLSSTANDBY)
+    {
+       boilerOffTemp = 30;
+    }
+    else if (controlState == CONTROLSSHUTDOWN)
+    {
+       boilerOffTemp = 40;
+    }
     lastLogAnnaAverage = annaAverage;
     nextDemandLogAt = sNow + demandLogInterval;
     // "time,tado,offtemp,chdemand,hwdemand",
-    String dataline = String(annaAverage) + C + String(boilerOffTemp)
+    String dataline = String(annaAverage) + C + String(boilerOffTempT)
                     + C + String(logChDemandAs) + C + String(logHwDemandAs);
     logIx(DEMANDLOGFILE, dataline);
   }
@@ -1023,29 +1022,8 @@ void display1()
   updateDisplayLine(3,s);
 }
 
-/*
-void display2()
-{
-  // was display for changing config
-}
-void display3()
-{
-  // had display of last inputs (relevant) sd, rtc, elased time
-}
-void display4()
-{
-  // sensor temperatures display - poss keep
-  // list temperatures of mapped sensors
-}
-
-void display5()
-{
-  // list sensors as found with temp and selector
-  // all sensors so can map - need re-implement
-}
-*/
-
-// reads the Tado boiler analog singal
+// reads the Tado boiler analog singal & sets CH demand ch dump and boiler temperatures
+// contains steps to limit change frequency and a provide hysteresis
 void readTadoAnalog()
 {
   // take average of last sample values as raw analogue (0-4095)
@@ -1081,53 +1059,96 @@ void readTadoAnalog()
   annaTotal -= annaValues[dropIx];
   annaAverage = annaTotal / (annaSampleSize - 1) * 100.0 / 4096.0;
 
-  // determine if chdemand on or off - allow for min switching interval && hysterisis
-  if (controlState == CONTROLSOFF)
+  // work from here with annaAverage...
+  
+  if (!chEnabled)
   {
+    // CH is off - just driven by HW demand
+    chDumpOk = false;
     chDemand = false;
+    annaHyst = 0;
   }
-  else if (annaAverage >= configArr[annaLowIx].value)
+  else if (sNow > nextAnnaChange)
   {
-    if (!chDemand)
+    // only worth chacking if beyond change moratorium
+    // hyst will be 0 or -ve
+    int newTadoLevel;
+    if (annaAverage < configArr[annaOffIx].value + annaHyst)
     {
-      if (sNow >= annaChangeAt)
-      {
-        annaChangeAt = sNow + configArr[annaChangeIntervalIx].value;
-        chDemand = true;
-        log("TadoCH > ON");
-      }
-      //      else
-      //      {
-      //        log("on t-" + String(annaChangeAt-now));
-      //      }
+      newTadoLevel = 1;
     }
-  }
-  else if (annaAverage < configArr[annaLowIx].value - configArr[annaHystIx].value)
-  {
-    if (chDemand)
+    else if (annaAverage >= configArr[annaChIx].value + annaHyst)
     {
-      if (sNow >= annaChangeAt)
+      newTadoLevel = 3;
+    }
+    else
+    {
+      newTadoLevel = 2;
+    }
+    if (newTadoLevel != tadoLevel)
+    {
+      // has changed - moratorium for further change..
+      nextAnnaChange = sNow + configArr[annaChangeIntervalIx].value;
+      if (newTadoLevel > tadoLevel)
       {
-        annaChangeAt = sNow + configArr[annaChangeIntervalIx].value;
+        // rising
+        annaHyst = - configArr[annaHystIx].value;
+      } 
+      else if (newTadoLevel < tadoLevel)
+      {
+        // falling
+        annaHyst = 0;
+      }
+      tadoLevel = newTadoLevel;
+      switch (tadoLevel)
+      {
+        case 1:
+          log("Tado > OFF");
+          break;
+        case 2:
+          log("Tado > DUMP");
+          break;
+        case 3:
+          log("Tado > CHDEMAND");
+          break;
+        default:
+          log("Tado > ?????");
+          break;
+      }
+    }
+    switch (tadoLevel)
+    {
+      case 2:
+        chDumpOk = true;
         chDemand = false;
-        log("TadoCH > OFF");
-      }
-      //      else
-      //      {
-      //        //log("off t-" + String(annaChangeAt-now));
-      //      }
+        break;
+      case 3:
+        chDumpOk = false;
+        chDemand = true;
+        break;
+      default:
+        chDumpOk = false;
+        chDemand = false;
+        break;
     }
   }
+
   // determine demand boiler temp
-  float temp = (annaAverage - configArr[annaLowIx].value) / (configArr[annaHighIx].value -  configArr[annaLowIx].value) *
+  float temp = (annaAverage - configArr[annaChIx].value) / (configArr[annaHighIx].value -  configArr[annaChIx].value) *
                (configArr[thermostatHighIx].value - configArr[thermostatLowIx].value) +  configArr[thermostatLowIx].value;
-  boilerOffTemp = constrain(temp, configArr[thermostatLowIx].value, configArr[thermostatHighIx].value);
-  // if HW demand must be sufficient for HW
-  if (hwDemand)
+  temp = constrain(temp, configArr[thermostatLowIx].value, configArr[thermostatHighIx].value);
+
+  if (hwDemand & !chDemand)
   {
-    boilerOffTemp = constrain(temp, configArr[thermostatHwIx].value, configArr[thermostatHighIx].value);
+    // HW demand only - set to HW heating temperature otherwise CH derived temp prevails.
+    boilerOffTemp = configArr[thermostatHwIx].value;
+  }
+  else
+  {
+    boilerOffTemp = temp;
   }
   boilerOnTemp = boilerOffTemp - configArr[thermostatHystIx].value;
+  // all done.
 }
 
 void readHWTemp()
@@ -1186,19 +1207,12 @@ void calculate()
     log(s);
   }
 
-  if (controlState == CONTROLSOFF)
+  if (!chDemand && !hwDemand)
   {
-      setHwPumpOn = false;
-      setBoilerOff = false;
-      setHwValveOn = false;
-      setChValveOn = false;
-  }
-
-  else if (!chDemand && !hwDemand)
-  {
-    // if demand dropped with boiler lit - record cycle.
-    if (!chDemand && !hwDemand && (prevChDemand || prevHwDemand) && !setBoilerOff)
+    // no demand from HW or CH
+    if ((prevChDemand || prevHwDemand) && !setBoilerOff)
     {
+      // demand dropped with boiler lit - record cycle.
       boilerOnElapsed =   sNow - lastBoilerOnAt;
       nextBoilerOnAt = max(nextBoilerOnAt, sNow + configArr[anticycleOffOnIx].value);
       lastBoilerOffAt = sNow;
@@ -1215,9 +1229,9 @@ void calculate()
       highestBoilerTemp = 0;
       lowestBoilerTemp = 100;
       log("drop demand when lit; ontime=" + formatIntMMMSS(boilerOnElapsed) + "; dc=" + String(dutyCycle));
-        
     }
     setHwPumpOn = false;
+    
     if (boilertemps[0] > configArr[shutdownTempIx].value && !breakShutdownCycle)
     {
       if (tempLowLimit)
@@ -1227,20 +1241,17 @@ void calculate()
       }
       else
       {
-        // dump heat cycle
+        // dump heat cycle - either to CH if Tado > off or to CH
         controlState = CONTROLSSHUTDOWN;
-        if (prevControlState != CONTROLSSHUTDOWN)
-        {
-          shutdownChValve = prevChDemand;
-        }
-        setChValveOn = shutdownChValve;
-        setHwValveOn = true;
+        setChValveOn = chDumpOk;
+        setHwValveOn = !setChValveOn;
         setBoilerOff = true;
+        boilerOffDelayUntil = sNow + 5;    // makes sure we hold boiler off till valves release
       }
     }
     else
     {
-      // wait for demand
+      // reached end of shutdown - wait for demand
       controlState = CONTROLSSTANDBY;
       setChValveOn = false;
       setHwValveOn = false;
@@ -1249,6 +1260,7 @@ void calculate()
   }
   else
   {
+    // there is demand 
     breakShutdownCycle = false;
     setChValveOn = false;
     setHwValveOn = false;
@@ -1376,8 +1388,6 @@ void lcdReInit()
   }
 }
 
-
-
 void readInputs()
 {
   lastInputs = PCF_01.read8();
@@ -1396,8 +1406,7 @@ void readInputs()
 }
 
 // assumes we have last state in lastInputs
-// only change one at a time - !setboileroff is delayed after valve off
-int boilerOffDelayAt = 0;
+// only change one at a time
 
 void setOutputs()
 {
@@ -1422,20 +1431,12 @@ byte setOutputs2(byte existB)
   bitWrite(newB, CHVALVEBIT, !chv);
   if (newB != existB)
   {
-    if (!chv)
-    {
-      boilerOffDelayAt = sNow + configArr[boilerOffDelayIx].value;
-    }
     log("CHVALVE > " + onOffS(chv));
     return newB;
   }
   bitWrite(newB, HWVALVEBIT, !setHwValveOn);
   if (newB != existB)
   {
-    if (!(setHwValveOn))
-    {
-      boilerOffDelayAt = sNow + + configArr[boilerOffDelayIx].value;
-    }
     log("HWVALVE > " + onOffS(setHwValveOn));
     return newB;
   }
@@ -1445,14 +1446,15 @@ byte setOutputs2(byte existB)
     log("HWPUMP > " + onOffS(setHwPumpOn));
     return newB;
   }
-  if (sNow >= boilerOffDelayAt)
+  if (sNow < boilerOffDelayUntil && !setBoilerOff)
   {
-    bitWrite(newB, BOILEROFFBIT, !setBoilerOff);
-    if (newB != existB)
-    {
-      log("BOILEROFF > " + onOffS(setBoilerOff));
-      return newB;
-    }
+    return newB;      // don't release yet! 
+  }
+  bitWrite(newB, BOILEROFFBIT, !setBoilerOff);
+  if (newB != existB)
+  {
+    log("BOILEROFF > " + onOffS(setBoilerOff));
+    return newB;
   }
   return newB;
 }
@@ -1480,7 +1482,7 @@ void I2CScan()
   log(s);
 }
 
-
+/*
 int lastClockFreq = -1;
 void setClockFreq()
 {
@@ -1506,6 +1508,7 @@ void setClockFreq()
     lastClockFreq = freq;
   }
 }
+*/
 
 void dohelp()
 {
@@ -1523,6 +1526,7 @@ void dohelp()
   cmdlog("m - show sensor map");
   cmdlog("mnn - change sensor ud");
   cmdlog("d - diagnostics");
+  cmdlog("t - sendstatus");
 }
 
 void parseCmd()
@@ -1556,15 +1560,15 @@ void parseCmd()
       break;
 
     case 's':
-      if (controlState != CONTROLSOFF)
+      if (chEnabled)
       {
-        controlState = CONTROLSOFF;
-        log("state set to off");
+        chEnabled = false;
+        log("ch disabled");
       }
       else
       {
-        controlState = CONTROLSSTANDBY;
-        log("state set to standby");
+        chEnabled = true;
+        log("ch enabled");
       }
       break;
 
@@ -1596,6 +1600,10 @@ void parseCmd()
         cmdlog(ss);
         break;
       }
+
+    case 't':
+      sendStatus++;;
+      break;
    
     default:
       cmdlog("'" + String(buffer[0]) + "' ??");
@@ -1675,6 +1683,7 @@ void setup()
 {
   // basics
   Serial.begin(115200);
+  Serial2.begin(115200);
 
   // PFC control interface
   PCF_01.begin(255);  // set all bits on
@@ -1685,7 +1694,6 @@ void setup()
   EEPROM.begin(configSize * 2);
   loadFromEprom();
 
-#ifdef USEBT 
    // bluetooth
   if (configArr[btNameIx].value > 0)
   {
@@ -1697,9 +1705,7 @@ void setup()
   {
     log("bluetooth disabled");  
   }
-#else
-  Serial2.begin(9600);
-#endif
+
   
   // log data headers
   for (int ix = 0; ix < NUMLOGFILES; ix++)
@@ -1766,8 +1772,9 @@ void setup()
   sensors.requestTemperatures();
   
   delay(1000);
- 
 }
+
+
 
 void loop()
 {
@@ -1775,31 +1782,22 @@ void loop()
   sNow = millis() / 1000;
 
   //input from serial or BT treated equally
-#ifdef USEBT 
-  while (Serial.available() > 0 || (SerialBT.hasClient() && SerialBT.available() > 0))
+  while (Serial.available() || Serial2.available() || (SerialBT.hasClient() && SerialBT.available()))
   {
     char c;
-    if (Serial.available() > 0)
+    if (Serial.available())
     {
       c = Serial.read();
+    }
+    else if (Serial2.available())
+    {
+      c = Serial2.read();
     }
     else
     {
       c= SerialBT.read();
     }
-#else
-  while (Serial.available() > 0 || Serial2.available() > 0)
-  {
-    char c;
-    if (Serial.available() > 0)
-    {
-      c = Serial.read();
-    }
-    else
-    {
-      c= Serial2.read();
-    }
-#endif
+
     if ((c == '\r' || c == '\n'))
     {
       if (bPtr > 0)
@@ -1816,9 +1814,11 @@ void loop()
   // check for 1 second boundary
   if (millis() >= nextMillis)
   {
-    nextMillis += 1000;
-    unsigned int startMillis = millis();
     digitalWrite(ledPin, 1);
+    
+    unsigned int startMillis = millis();
+    nextMillis += 1000;
+    
     //!!setClockFreq();
     if (controlState == CONTROLSSTANDBY && sNow > configArr[autoRestartHoursIx].value * 3600)
     {
@@ -1830,25 +1830,31 @@ void loop()
     getTemperatures();
     selfTest();
     readInputs();
-    //getTemperatures();
     readTadoAnalog();
     readHWTemp(); 
     calculate();
     setOutputs();
     demandLog();
-    
     updateDisplay();
-    digitalWrite(ledPin, 0);
-    elapsedMillis = millis() - startMillis;
    
     // previous state for next pass
     prevControlState = controlState;
     prevChDemand = chDemand;
     prevHwDemand = hwDemand;
     sensors.requestTemperatures(); // pick up next pass
+
+    esp_task_wdt_reset();    // tickle watchdog
+
+    elapsedMillis = millis() - startMillis;
+    if (sendStatus > 0)
+    {
+      statusLog();
+      sendStatus--;;
+    }
+    digitalWrite(ledPin, 0);
   }
   
-  esp_task_wdt_reset();    // tickle watchdog
+  
 
   delay(5);
 }
@@ -1860,5 +1866,7 @@ void loop()
   - logging delivered by serial port to capture via logger device
 
 2021-10-07  use bluetooth / serial for control
+
+2022-02-19  add status log , also use serial2, remove time from log lines
   
 */
