@@ -62,10 +62,19 @@ const int oneWireBus = 15;
 OneWire ds(oneWireBus);
 // Pass our oneWire reference to Dallas Temperature sensor
 DallasTemperature sensors(&ds);
-// data
-const int SENSORMAPCOUNT = 2;    // temperature by userid - handle up to this many
-int sensorMapping[SENSORMAPCOUNT];
-float temperatures[SENSORMAPCOUNT];
+// sensors are
+// 0 = boiler out
+// 1 = boiler in
+// 2 = hw tank mid
+// 3 = hw tank bottom
+const int SENSORMAPCOUNT = 6;    // temperature by userid - handle up to this many - but only use 4
+int sensorMapping[SENSORMAPCOUNT]; // maps the random order of library to sensor user id
+float temperatures[SENSORMAPCOUNT]; // last read temperatures
+const int dsBoilerOutIx = 0;           // boiler = 0
+const int dsBoilerInIx = 1;             // boiler in
+const int dsMidTankIx = 2;
+const int dsBottomTankIx = 3;
+int nextSensorIx = 1;             // for round robin reas of sensort 1-n
 const int dsRetries = 4;
 int dsErrorCount[dsRetries];               // count errors at retry level
 // --------- dallas/onwire end --------------
@@ -88,28 +97,23 @@ const byte PFCADDRESS = 0x20;
 PCF8574 PCF_01(PFCADDRESS);
 const byte CHVALVEBIT = 0;       // overrides pump to on
 const byte HWVALVEBIT = 1;       // override HW valve to on
-const byte HWPUMPBIT = 2;        // turn on hw pump
+//const byte HWPUMPBIT = 2;        // turn on hw pump
+const byte SPAREBIT = 2;
 const byte BOILEROFFBIT = 3;     // interrupts thermostat on boiler
-const byte CHDEMANDBIT = 4;       // read CH valve state
-const byte HWDEMANDBIT = 5;       // read HW valve state
-const byte TEMPLOLIMBIT  = 6;   // thermostat in state
-const byte READMASK = 0xF0;      // 4 top bits high - must set on write as input
 
 // values to set outputs
-boolean setBoilerOff = false;
-boolean setChValveOn = false;
-boolean setHwValveOn = false;
-boolean setHwPumpOn = false;
+boolean setBoilerOff = false;    // turns boiler flame off - used as memory of heating / cooling
+boolean setChValveOn = false;    // opens HW valve in shutdown - used as memory whether currently in shutdown
+boolean setHwValveOn = false;    // opens CH valve in shutdown - ditto
+//boolean setHwPumpOn = false;
 
 //values from read state & inputs
 int tadoLevel = 0;                // from tado, 1 = off, 2 = heat dump ok, 3 = chDemand 
-boolean chEnabled = true;          // control to switch CH off - just does HW actions.
-boolean extChDemand = false;      // ch demand from backup stat
+boolean chEnabled = true;         // control to switch CH off - just does HW actions.
 boolean chDemand = false;         // ch demand from analogue
 boolean chDumpOk = false;         // enough ch demand from tado to be worth dumping in shutdown
-boolean extHwDemand = false;      // hw demand from hw stats
-boolean hwDemand = false;         // hw demand from dallas
-boolean tempLowLimit = false;     // kicks on when boiler hits low protect level - overrides setBoilerOff
+boolean hwDemand = false;         // hw demand from tank top sensor
+boolean hwPiggyback = false;      // from bottom tank sensor - hw on if ch on
 // and previous
 boolean prevChDemand = false;         // ch demand from ch stats
 boolean prevHwDemand = false;         // hw demand from hw stats
@@ -127,7 +131,7 @@ struct ConfigItem
   int minValue;
   int maxValue;
 };
-const int configSize = 20;
+const int configSize = 23;
 ConfigItem configArr[configSize];// =  {{"aa","aa-name",5,5,2,10},{"bb","bb-name",5,5,2,10}};
 
 void addToConfig(int ix, String codex, String namex, int minValuex, int defValuex, int maxValuex)
@@ -153,54 +157,71 @@ void addToConfig(int ix, String codex, String namex, int minValuex, int defValue
 }
 // config data from eeprom - use int array
 
-//int configArr[configSize];
-int annaOffIx = -1;
-int annaChIx = -1;
-int annaHighIx = -1;
-int annaHystIx = -1;             // hysteresis for analog change
-int annaChangeIntervalIx = -1;   // limit frequence of change (s)
-int thermostatSamplesIx = -1;    // samples used to define temp rate
-int thermostatLowIx = -1;
-int thermostatHighIx = -1;
-int thermostatHwIx = -1;
-int thermostatHystIx = -1;
+int tadoOffIx = -1;
+int tadoChIx = -1;
+int tadoHighIx = -1;
+int tadoHystIx = -1;             
+int tadoIntervalIx = -1;   
+int thermostatSamplesIx = -1;    
+int boilerLowIx = -1;
+int boilerHighIx = -1;
+int boilerHwIx = -1;
+int boilerHystIx = -1;
+int hwTempIx = -1;
+int hwHystIx = -1;
+int hwBtmTempIx = -1;
+int hwIntervalIx = -1; 
 int anticycleOnOnIx = -1;
 int anticycleOffOnIx = -1;
 int rateAdjustIx = -1;
 int shutdownTempIx = -1;
 int boilerOffDelayIx = -1;
-int hwPumpHystIx = -1;
+//int hwPumpHystIx = -1;
 int autoRestartHoursIx = -1;
 int selfTestIx = -1;
 int btNameIx = -1;           //- appends -n to nale
 int dsErrWarnLevelIx = -1;
 
+// read here for meaning
 void InitConfig()
 {
   int ix = 0;
-  annaOffIx = ix++;  addToConfig(annaOffIx, "al", "analogOff", 0,3,50);
-  annaChIx = ix++;  addToConfig(annaChIx, "al", "analogCh", 0,10,50);
-  annaHighIx = ix++; addToConfig(annaHighIx, "ah", "analogHigh", 50,80,100);
-  annaHystIx = ix++;  addToConfig(annaHystIx, "ay", "analogHyst", 0, 1, 10);
-  annaChangeIntervalIx = ix++;  addToConfig(annaChangeIntervalIx, "ai", "analogChgIntvl", 0, 60, 180);
+  tadoOffIx = ix++;  addToConfig(tadoOffIx, "to", "tadoOff", 0,3,50);      // tado level where zero demand - valves likely closed
+  tadoChIx = ix++;  addToConfig(tadoChIx, "tc", "tadoCh", 0,10,50);        // tado level where we kick on boiler at low temp
+  tadoHighIx = ix++; addToConfig(tadoHighIx, "th", "tadoHigh", 50,80,100); // max value from tado for boiler at hi temp
+  tadoHystIx = ix++;  addToConfig(tadoHystIx, "ty", "tadoHyst", 0, 1, 10); // hysteresis on tado level change
+  tadoIntervalIx = ix++;  addToConfig(tadoIntervalIx, "ti", "tadoChgIntvl", 0, 60, 180);  // frequency limit on change
   thermostatSamplesIx = ix++;  addToConfig(thermostatSamplesIx, "ts", "thermostatSamples", 4, 12, maxThermostatSamples);
-  thermostatLowIx = ix++;  addToConfig(thermostatLowIx, "tl", "thermostatLow", 40, 50, 60);
-  thermostatHighIx = ix++;  addToConfig(thermostatHighIx, "th", "thermostatHigh", 60, 65, 70);
-  thermostatHwIx = ix++;  addToConfig(thermostatHwIx, "tw", "thermostatHW", 55, 60, 70);
-  thermostatHystIx = ix++;  addToConfig(thermostatHystIx, "ty", "thermostatHyst", 0, 4, 10);
+  boilerLowIx = ix++;  addToConfig(boilerLowIx, "bl", "boilerLowTemp", 40, 50, 60);     // lowest boiler temp in range
+  boilerHighIx = ix++;  addToConfig(boilerHighIx, "bh", "boilerHighTemp", 60, 65, 70);  // highest boiler temp in range  
+  boilerHwIx = ix++;  addToConfig(boilerHwIx, "tw", "thermostatHW", 55, 60, 70);// boiler temp when just HW 
+  boilerHystIx = ix++;  addToConfig(boilerHystIx, "by", "thermostatHyst", 0, 4, 10);     
+  hwTempIx = ix++;  addToConfig(hwTempIx, "ht", "hotWaterTemp", 40, 45, 55);
+  hwHystIx = ix++;  addToConfig(hwHystIx, "hy", "hotWaterHyst", 0, 2, 10);
+  hwBtmTempIx = ix++;  addToConfig(hwBtmTempIx, "bt", "hotWaterBottomTemp", 30, 45, 55);
+  hwIntervalIx = ix++;  addToConfig(hwIntervalIx, "hi", "hwChgIntvl", 0, 60, 180);  // frequency limit on change
   anticycleOnOnIx = ix++;  addToConfig(anticycleOnOnIx, "a1", "anticycleOnOn", 30, 120, 180);
   anticycleOffOnIx = ix++;  addToConfig(anticycleOffOnIx, "a2", "anticycleOffOn", 15, 30, 120);
   rateAdjustIx = ix++;  addToConfig(rateAdjustIx, "ra", "rateAdjust", 0, 25, 50);
   shutdownTempIx = ix++;  addToConfig(shutdownTempIx, "st", "shutdownTemp", 40, 45, 60);
   boilerOffDelayIx = ix++;  addToConfig(boilerOffDelayIx, "od", "boileroffdelay", 0, 20, 30);
-  hwPumpHystIx = ix++;  addToConfig(hwPumpHystIx, "hy", "hwPumpHyst", 0, 2, 5);
+ // hwPumpHystIx = ix++;  addToConfig(hwPumpHystIx, "hy", "hwPumpHyst", 0, 2, 5);
   autoRestartHoursIx = ix++;  addToConfig(autoRestartHoursIx, "ar", "autoRestartHrs", 1, 24, 1000);
-  selfTestIx = ix++;  addToConfig(selfTestIx, "tt", "selfTest", 0, 0, 2);
+  selfTestIx = ix++;  addToConfig(selfTestIx, "tt", "selfTest", 0, 0, 3);
   btNameIx = ix++;  addToConfig(btNameIx, "bt", "btName", 0, 1, 9);
   dsErrWarnLevelIx = ix++;  addToConfig(dsErrWarnLevelIx, "de", "dsErrlevel", 0, 1, 5);
   log("config items = " + String(ix) + " / " + String(configSize));
 }
 
+void resetConfig()
+{
+  cmdlog("resetting config");
+  for (int ix = 0; ix < configSize ; ix++)
+  {
+    configArr[ix].value = configArr[ix].defValue;
+  }
+  logConfig();
+}
 
 // state engine - state enumerations
 int controlState = 0;
@@ -242,19 +263,23 @@ unsigned long lastBoilerOffAt;          // last turn off
 unsigned long boilerOffDelayUntil = 0;  // when releasing boiler off - delays for a few secs while valves release
 float dutyCycle = 0;          // on / (on + off)%
 unsigned long nextBoilerOnAt;           // used specifically for anti cycle - earliest allowable on
-bool breakShutdownCycle = false;  // if we get trigger of boiler on in shotdown
+
 byte lastInputs = 0;          // last PFC read
 // analog input processing
-unsigned long nextAnnaChange = 0;       // next time we can change Tado demand state - limts change
+unsigned long lastTadoChange = 0;       // next time we can change Tado demand state - limts change
 int lastTadoLevel = 0;
-int annaHyst = 0;
+int tadoHyst = 0;
 const int annaSampleSize = 10;            // size of averaging ring buffer
 int annaValues[annaSampleSize];           // ring bufer for average
 int annaValuesPtr = 0;                     // pointer into it
 float annaAverage = 0;        // average value used as 0-100
 float boilerOffTemp = 0;      // boiler demand temp C - tirn off point
 float boilerOnTemp = 0;       // boiler demand temp C - turn on point
-int sendStatus = 0;         // cmd to send a status output as a status reply each loop - num times
+int sendStatus = 0;           // cmd to send a status output as a status reply each loop - num times
+
+unsigned long lastHwChange = 0;   // for next time allowed to change hw demand
+
+unsigned long lastEndShutdown = 0;   // for next time allowed to change shutdown
 
 // demand log variables
 unsigned long nextDemandLogAt = 10;
@@ -284,30 +309,27 @@ int lastStConfig = 0;
 
 int stControl = 0;     // tado analog
 unsigned long stTimer;
-float stAnnaValue = 0;
-float stAnnaMax = 0;
-bool stExtChDemand = false;  // keep false
+float stTadoValue = 0;
+float stTadoMax = 0;
+
 bool stTempLowLimit = false;
 int stHwControl = 0;  // HW
 unsigned long stHwTimer;
 bool stExtHwDemand = false;
 float stTemp = 20;   // boiler temp
+float stHwTemp = 55;   // hw temp
+float stHwBtmTemp = 55;   // hw temp
+float stHwTempTarget = 40;
 
-void resetConfig()
-{
-  cmdlog("resetting config");
-  for (int ix = 0; ix < configSize ; ix++)
-  {
-    configArr[ix].value = configArr[ix].defValue;
-  }
-  logConfig();
-}
+
 
 float randomF(float v1, float v2)
 {
   float f = random(v1 * 100, v2 * 100);
   return f / 100.0;
 }
+
+// self test 3 in manual control
 
 void selfTest()
 {
@@ -329,11 +351,44 @@ void selfTest()
       selfTest2(initMe);
       break;
 
+    case 3:
+      stActive = true;
+      selfTest3(initMe);
+      break;
+
     default:
       stActive = false;
       stControl = 0;
       stHwControl = 0;
       break;
+  }
+}
+
+void handleSim()
+{
+  for (int ix = 1; ix < bPtr; ix++)
+  {
+    char c = buffer[ix];
+    if (c == '1') stTemp++;
+    if (c == '2') stTemp--;
+    if (c == '3') stTadoValue++;
+    if (c == '4') stTadoValue--;
+    if (c == '5') stHwTemp++;
+    if (c == '6') stHwTemp--;
+    if (c == '7') stHwBtmTemp++;
+    if (c == '8') stHwBtmTemp--;
+  }
+}
+
+void selfTest3(bool initMe)
+{
+  if (initMe)
+  {
+    configArr[anticycleOnOnIx].value = 20;
+    configArr[anticycleOffOnIx].value = 10;
+    configArr[tadoIntervalIx].value = 10;
+    configArr[hwIntervalIx].value = 10;
+    configArr[rateAdjustIx].value = 1;
   }
 }
 
@@ -344,14 +399,20 @@ void selfTest1(bool initMe)
     demandLogInterval = 10;
     configArr[anticycleOnOnIx].value = 20;
     configArr[anticycleOffOnIx].value = 10;
+    configArr[tadoIntervalIx].value = 10;
+    configArr[hwIntervalIx].value = 10;
+    configArr[rateAdjustIx].value = 1;
+    stHwTemp = configArr[hwTempIx].value+2;
+    stHwBtmTemp = configArr[hwBtmTempIx].value-5;
+    stHwTempTarget = configArr[hwTempIx].value-configArr[hwHystIx].value-10;
   }
   int t;
   switch (stHwControl)
   {
     case 0:
       t = random(30, 60);
-      log("ST-1 HW hold OFF " + String(t) + "s");
-      stExtHwDemand = false;
+      stHwTemp = configArr[hwTempIx].value+2;
+      log("ST-1 HW hold at " + String(stHwTemp) + " for " + String(t) + "s");
       stHwTimer = sNow + t;
       stHwControl++;
       break;
@@ -362,16 +423,33 @@ void selfTest1(bool initMe)
       }
       break;
     case 2:
-      t = random(30, 60);
-      log("ST-1 HW hold ON " + String(t) + "s");
-      stExtHwDemand = true;
-      stHwTimer = sNow + t;
+      stHwTempTarget = configArr[hwTempIx].value-configArr[hwHystIx].value-10;
+      log("ST-1 HW drop slowly to  " + String(stHwTempTarget));
       stHwControl++;
       break;
     case 3:
-      if (sNow > stHwTimer)
+      if (stHwTemp <= stHwTempTarget)
       {
-        stHwControl = 0;
+        stHwControl++;
+      }
+      else
+      {
+        stHwTemp-= randomF(0.1,0.2);
+      }
+      break;
+    case 4:
+      stHwTempTarget = configArr[hwTempIx].value+2;
+      log("ST-1 HW rise slowly to  " + String(stHwTempTarget));
+      stHwControl++;
+      break;
+    case 5:
+      if (stHwTemp >= stHwTempTarget)
+      {
+        stHwControl = 0;;
+      }
+      else
+      {
+        stHwTemp+= randomF(0.1,0.2);
       }
       break;
   }
@@ -379,25 +457,25 @@ void selfTest1(bool initMe)
   switch (stControl)
   {
     case 0:
-      log("ST-1 Anna hold 0% 10s");
-      stAnnaValue = 0;
-      stTimer = sNow + 10;
+      log("ST-1 Tado hold 0 30s");
+      stTadoValue = 0;
+      stTimer = sNow + 30;
       stControl++;
       break;
     case 1:
       if (sNow > stTimer)
       {
         stControl++;
-        stAnnaMax = randomF(40, 90);
-        log("ST-1 Anna fast ramp up to " + String(stAnnaMax));
+        stTadoMax = randomF(40, 90);
+        log("ST-1 Tado fast ramp up to " + String(stTadoMax));
       }
       break;
     case 2:
-      stAnnaValue += randomF(2, 5);
-      if (stAnnaValue >= stAnnaMax)
+      stTadoValue += randomF(2, 5);
+      if (stTadoValue >= stTadoMax)
       {
         stControl++;
-        log("ST-1 Anna hold until cooling");
+        log("ST-1 Tado hold until cooling");
       }
       break;
     case 3:
@@ -405,24 +483,23 @@ void selfTest1(bool initMe)
       {
         stControl++;
         stTimer = sNow + 20;
-        log("ST-1 Anna hold " + String(stAnnaValue) + " 20s");
+        log("ST-1 Tado hold " + String(stTadoValue) + " 20s");
       }
       break;
     case 4:
       if (sNow > stTimer)
       {
         stControl++;
-        log("ST-1 Anna slow ramp down to 0%");
+        log("ST-1 Tado slow ramp down to 0%");
       }
       break;
     case 5:
-      stAnnaValue -= randomF(0, 2);
-      if (stAnnaValue <= 0)
+      stTadoValue -= randomF(0, 2);
+      if (stTadoValue <= 0)
       {
-        stAnnaValue = 0;
+        stTadoValue = 0;
         stControl++;
-        log("ST-1 Anna hold until off");
-
+        log("ST-1 Tado hold until off");
       }
       break;
     case 6:
@@ -430,13 +507,13 @@ void selfTest1(bool initMe)
       {
         stControl = 1;
         stTimer = sNow + 20;
-        log("ST-1 anna holding to OFF abanndon on HW demand; hold 20s");
+        log("ST-1 Tado holding to OFF abanndon on HW demand; hold 20s");
       }
       if (controlState == CONTROLSSTANDBY)
       {
         stControl = 1;
         stTimer = sNow + 20;
-        log("ST-1 anna holding to OFF complete; hold 20s");
+        log("ST-1 Tado holding to OFF complete; hold 20s");
       }
       break;
   }
@@ -462,6 +539,8 @@ void selfTest2(bool initMe)
     demandLogInterval = 10;
     configArr[anticycleOnOnIx].value = 20;
     configArr[anticycleOffOnIx].value = 10;
+    stHwTemp = configArr[hwTempIx].value+2;
+    stHwBtmTemp = configArr[hwBtmTempIx].value-5;
     stControl = 0;
   }
   int t;
@@ -470,7 +549,7 @@ void selfTest2(bool initMe)
   {
     case 0:
       log("ST-2 hold off 10s");
-      stAnnaValue = 0;
+      stTadoValue = 0;
       stExtHwDemand = false;
       stTimer = sNow + 10;
       stControl++;
@@ -478,7 +557,7 @@ void selfTest2(bool initMe)
     case 1:
       if (sNow > stTimer)
       {
-        stAnnaValue = 90;
+        stTadoValue = 90;
         stExtHwDemand = false;
         stControl++;
         log("ST-2 anna to 90, hw OFF; wait for cooling");
@@ -495,7 +574,7 @@ void selfTest2(bool initMe)
     case 3:
       if (sNow > stTimer)
       {
-        stAnnaValue = 0;
+        stTadoValue = 0;
         stExtHwDemand = false;
         stControl++;
         log("ST-2 anna to 0; hw OFF; wait OFF");
@@ -513,7 +592,7 @@ void selfTest2(bool initMe)
     case 5:
       if (sNow > stTimer)
       {
-        stAnnaValue = 0;
+        stTadoValue = 0;
         stExtHwDemand = true;
         stControl++;
         log("ST-2 anna 0; hw to ON; wait cooling");
@@ -530,7 +609,7 @@ void selfTest2(bool initMe)
      case 7:
       if (sNow > stTimer)
       {
-        stAnnaValue = 0;
+        stTadoValue = 0;
         stExtHwDemand = false;
         stControl++;
         log("ST-2 anna 0; hw to OFF; wait till OFF");
@@ -588,9 +667,9 @@ void logIx(int ix, String s)
 void statusLog()
 {
   //ontemp,current,deltaadj,offtemp,ontime,offtime,duty,tado,intemp,ch,hw,state
-  String dataline = String(boilerOnTemp) + C + String(boilertemps[0],2) + C + String(boilerTempAdjustment,2) 
+  String dataline = String(boilerOnTemp) + C + String(boilertemps[dsBoilerOutIx],2) + C + String(boilerTempAdjustment,2) 
   + C + String(boilerOffTemp) + C + String(boilerOnElapsed) + C + String(boilerOffElapsed)
-  + C + String(dutyCycle,1) + C + String(annaAverage,2) + String(temperatures[1])
+  + C + String(dutyCycle,1) + C + String(annaAverage,2) + String(temperatures[dsBoilerInIx])
   + C + String(chDemand || setChValveOn) + C + String(hwDemand || setHwValveOn) + C + controlStateS(controlState);
   logIx(STATUSLOGFILE, dataline);
 }
@@ -680,7 +759,8 @@ void logConfig()
     {
       s += ".";
     }
-    cmdlog(configArr[ix].code + "-" + configArr[ix].name + s + " = " + String(configArr[ix].value) + "  (" + String(configArr[ix].minValue)+ " -" + String(configArr[ix].maxValue) + ")");
+    cmdlog(configArr[ix].code + "-" + configArr[ix].name + s + " = " + String(configArr[ix].value) 
+    + "  (" + String(configArr[ix].minValue)+ ">" + String(configArr[ix].defValue) + ">" + String(configArr[ix].maxValue) + ")");
     }
   }
 }
@@ -793,12 +873,21 @@ void mapSensors()
 }
 
 // does the temp reading and store
+// it takes 30-40 ms to do a get temp - so we always do 0 as its the boiler and then the 
+// rest on a round robin each loop
 void getTemperatures()
 {
-  // try start with 10ms delay
-  delay(10);
-  for (int ix = 0; ix < SENSORMAPCOUNT; ix++)
+  nextSensorIx++;
+  if (nextSensorIx < 1 || nextSensorIx > SENSORMAPCOUNT)
   {
+    nextSensorIx = 1;
+  }
+  for (int ix = 0; ix < 2; ix++)
+  {
+    if (ix == 1)
+    {
+      ix = nextSensorIx;
+    }
     if (sensorMapping[ix] >= 0 && sensorMapping[ix] < SENSORMAPCOUNT)
     {
       for (int it = 1; it <= dsRetries; it++)
@@ -815,14 +904,16 @@ void getTemperatures()
             log("!! ds read error ix=" + String(ix) + " x" + String(it));
             dsErrorCount[it-1]++;
           }
-          delay(10);
+          //delay(10);
         }
       }
     }
   }
   if (stActive)
   {
-    temperatures[0] = stTemp;
+    temperatures[dsBoilerOutIx] = stTemp;
+    temperatures[dsMidTankIx] = stHwTemp;
+    temperatures[dsBottomTankIx] = stHwBtmTemp;
   }
 }
 
@@ -981,11 +1072,16 @@ void display1()
   s = formatIntMMMSS(boilerOnElapsed) + " " + formatIntMMMSS(boilerOffElapsed) + " " + formatFloat(dutyCycle, 3, 0) + "%";
   updateDisplayLine(1,s);
 
-  s = formatFloat(annaAverage, 2, 1) + "%  " + formatFloat(temperatures[1], 2, 1);
+  s = formatFloat(annaAverage, 2, 1) + "  " + formatFloat(temperatures[dsBoilerInIx], 2, 1) 
+  + " " + formatFloat(temperatures[dsMidTankIx], 2, 1) + " " + formatFloat(temperatures[dsBottomTankIx], 2, 1);
   updateDisplayLine(2,s);
 
   s = "";
-  if (chDemand || setChValveOn)
+  if (chDemand)
+  {
+    s += "CH ";
+  }
+  else if (setChValveOn)
   {
     s += "ch ";
   }
@@ -994,7 +1090,11 @@ void display1()
     s += ".. ";
   }
 
-  if (hwDemand || setHwValveOn)
+  if (hwDemand)
+  {
+    s += "HW ";
+  }
+  else if (setHwValveOn)
   {
     s += "hw ";
   }
@@ -1002,22 +1102,30 @@ void display1()
   {
     s += ".. ";
   }
-  if (setHwPumpOn)
+  if (setBoilerOff)
   {
-    s += "hp ";
+    s += "bo ";
   }
   else
   {
     s += ".. ";
   }
-  if (tempLowLimit)
-  {
-    s += "lt ";
-  }
-  else
-  {
+//  if (setHwPumpOn)
+//  {
+//    s += "hp ";
+//  }
+//  else
+//  {
+//    s += ".. ";
+//  }
+ // if (tempLowLimit)
+ // {
+ //   s += "lt ";
+//  }
+//  else
+//  {
     s += ".. ";
-  }
+//  }
   s += controlStateS(controlState);
   updateDisplayLine(3,s);
 }
@@ -1028,14 +1136,14 @@ void readTadoAnalog()
 {
   // take average of last sample values as raw analogue (0-4095)
   annaValuesPtr++;
-  if (annaValuesPtr > annaSampleSize)
+  if (annaValuesPtr >= annaSampleSize)
   {
     annaValuesPtr = 0;
   }
   annaValues[annaValuesPtr] = analogRead(analogPin); // take current value
   if (stActive)  // override if self test
   {
-    annaValues[0] = stAnnaValue * 4096 / 100;
+    annaValues[annaValuesPtr] = stTadoValue * 4096 / 100;
   }
   // compute average
   long annaTotal = 0;
@@ -1043,41 +1151,31 @@ void readTadoAnalog()
   {
     annaTotal += annaValues[ix];
   }
-  int tempAverage = annaTotal / annaSampleSize;
-  // drop sample most away from average
-  int dropIx = 0;
-  int maxDiff = 0;
-  for (int ix = 0; ix < annaSampleSize; ix++)
-  {
-    if (abs(annaValues[ix] - annaAverage) > maxDiff)
-    {
-      maxDiff = abs(annaValues[0] - annaAverage);
-      dropIx = ix;
-    }
-  }
-  // take new average from remaining 9 scaled 0-100
-  annaTotal -= annaValues[dropIx];
-  annaAverage = annaTotal / (annaSampleSize - 1) * 100.0 / 4096.0;
+
+  annaAverage = annaTotal / (annaSampleSize) * 100.0 / 4096.0;
 
   // work from here with annaAverage...
-  
   if (!chEnabled)
   {
     // CH is off - just driven by HW demand
-    chDumpOk = false;
-    chDemand = false;
-    annaHyst = 0;
+    tadoLevel = 1;
+    tadoHyst = 0;
+    lastTadoChange = 0;
   }
-  else if (sNow > nextAnnaChange)
+  else if (sNow > (lastTadoChange + configArr[tadoIntervalIx].value));
   {
-    // only worth chacking if beyond change moratorium
+    // only worth checking if beyond change moratorium
+    // we have 3 state levels:
+    // state 1 - below off - no demand - no dump
+    // state 2 - above off - below ch - no demand - can dump
+    // state 3 = above CH - ch demand. 
     // hyst will be 0 or -ve
     int newTadoLevel;
-    if (annaAverage < configArr[annaOffIx].value + annaHyst)
+    if (annaAverage < (configArr[tadoOffIx].value + tadoHyst))
     {
       newTadoLevel = 1;
     }
-    else if (annaAverage >= configArr[annaChIx].value + annaHyst)
+    else if (annaAverage >= (configArr[tadoChIx].value + tadoHyst))
     {
       newTadoLevel = 3;
     }
@@ -1085,19 +1183,20 @@ void readTadoAnalog()
     {
       newTadoLevel = 2;
     }
+   
     if (newTadoLevel != tadoLevel)
     {
       // has changed - moratorium for further change..
-      nextAnnaChange = sNow + configArr[annaChangeIntervalIx].value;
+      lastTadoChange = sNow;
       if (newTadoLevel > tadoLevel)
       {
         // rising
-        annaHyst = - configArr[annaHystIx].value;
+        tadoHyst = - configArr[tadoHystIx].value;
       } 
       else if (newTadoLevel < tadoLevel)
       {
         // falling
-        annaHyst = 0;
+        tadoHyst = 0;
       }
       tadoLevel = newTadoLevel;
       switch (tadoLevel)
@@ -1116,44 +1215,88 @@ void readTadoAnalog()
           break;
       }
     }
-    switch (tadoLevel)
-    {
-      case 2:
-        chDumpOk = true;
-        chDemand = false;
-        break;
-      case 3:
-        chDumpOk = false;
-        chDemand = true;
-        break;
-      default:
-        chDumpOk = false;
-        chDemand = false;
-        break;
-    }
   }
+  switch (tadoLevel)
+  {
+    case 2:
+      chDumpOk = true;
+      chDemand = false;
+      break;
+    case 3:
+      chDumpOk = false;
+      chDemand = true;
+      break;
+    default:
+      chDumpOk = false;
+      chDemand = false;
+      break;
+  }
+  
 
   // determine demand boiler temp
-  float temp = (annaAverage - configArr[annaChIx].value) / (configArr[annaHighIx].value -  configArr[annaChIx].value) *
-               (configArr[thermostatHighIx].value - configArr[thermostatLowIx].value) +  configArr[thermostatLowIx].value;
-  temp = constrain(temp, configArr[thermostatLowIx].value, configArr[thermostatHighIx].value);
+  float temp = (annaAverage - configArr[tadoChIx].value) / (configArr[tadoHighIx].value -  configArr[tadoChIx].value) *
+               (configArr[boilerHighIx].value - configArr[boilerLowIx].value) +  configArr[boilerLowIx].value;
+  temp = constrain(temp, configArr[boilerLowIx].value, configArr[boilerHighIx].value);
 
   if (hwDemand & !chDemand)
   {
     // HW demand only - set to HW heating temperature otherwise CH derived temp prevails.
-    boilerOffTemp = configArr[thermostatHwIx].value;
+    boilerOffTemp = configArr[boilerHwIx].value;
   }
   else
   {
     boilerOffTemp = temp;
   }
-  boilerOnTemp = boilerOffTemp - configArr[thermostatHystIx].value;
+  boilerOnTemp = boilerOffTemp - configArr[boilerHystIx].value;
   // all done.
 }
 
 void readHWTemp()
 {
-  hwDemand = extHwDemand;
+  // have 2 stats on tank - mid and bottom. 
+  // Mid used to set HW demand and boiler tenmperature
+  // Bottom used to turn HW on in parallel with heating 
+
+  
+  if (sNow > (lastHwChange + configArr[hwIntervalIx].value));
+  {
+    if (temperatures[dsMidTankIx] > float(configArr[hwTempIx].value))
+    {
+      if (hwDemand)
+      {
+        hwDemand = false;
+        log("HW > OFF");
+        lastHwChange =  sNow;
+      }
+    }
+    else if (temperatures[dsMidTankIx] < float(configArr[hwTempIx].value - configArr[hwHystIx].value))
+    {
+      if (!hwDemand)
+      {
+        hwDemand = true;
+        log("HW > ON");
+        lastHwChange =  sNow;
+      }
+    }
+    if (temperatures[dsBottomTankIx] > float(configArr[hwBtmTempIx].value))
+    {
+      if (hwPiggyback)
+      {
+        hwPiggyback = false;
+        log("HWPiggyback > OFF");
+        lastHwChange =  sNow;
+      }
+    }
+    else if (temperatures[dsBottomTankIx] < float(configArr[hwBtmTempIx].value - configArr[hwHystIx].value))
+    {
+      if (!hwPiggyback)
+      {
+        hwPiggyback = true;
+        lastHwChange =  sNow;
+        log("HWPiggyback > ON");
+      }
+    }
+  }
 }
 
 void calculate()
@@ -1183,11 +1326,13 @@ void calculate()
     lowestBoilerTemp = boilertemps[0];
   }
 
+ /*
   if (chDemand != prevChDemand || hwDemand != prevHwDemand)
   {
     //logIx(DEMANDLOGFILE, String(hwDemand) + C + String(chDemand));   ?? check
     String s;
     // been a change
+   
     if (chDemand != prevChDemand)
     {
       s += "CH > " + onOffS(chDemand);
@@ -1205,7 +1350,9 @@ void calculate()
       s += ", HW = " + onOffS(hwDemand);
     }
     log(s);
+    
   }
+  */
 
   if (!chDemand && !hwDemand)
   {
@@ -1230,38 +1377,39 @@ void calculate()
       lowestBoilerTemp = 100;
       log("drop demand when lit; ontime=" + formatIntMMMSS(boilerOnElapsed) + "; dc=" + String(dutyCycle));
     }
-    setHwPumpOn = false;
-    
-    if (boilertemps[0] > configArr[shutdownTempIx].value && !breakShutdownCycle)
-    {
-      if (tempLowLimit)
-      {
-        breakShutdownCycle = true;
-        log("temp low limit in shutdown - stopped..");
-      }
-      else
-      {
-        // dump heat cycle - either to CH if Tado > off or to CH
-        controlState = CONTROLSSHUTDOWN;
-        setChValveOn = chDumpOk;
-        setHwValveOn = !setChValveOn;
-        setBoilerOff = true;
-        boilerOffDelayUntil = sNow + 5;    // makes sure we hold boiler off till valves release
-      }
-    }
-    else
+ //   setHwPumpOn = false;
+
+    // !!need to add a bit of hysteresis of change interval
+    if (boilertemps[0] < configArr[shutdownTempIx].value)
     {
       // reached end of shutdown - wait for demand
       controlState = CONTROLSSTANDBY;
       setChValveOn = false;
       setHwValveOn = false;
       setBoilerOff = false;
+      boilerOffDelayUntil = sNow + 5;    // makes sure we hold boiler off till valves release switch
+      lastEndShutdown = sNow;
+    }
+    else if ((setChValveOn || setHwValveOn) && setBoilerOff)
+    {
+      // already in shutdown
+      controlState = CONTROLSSHUTDOWN;
+      setChValveOn = chDumpOk;         // might change during shotdown
+      setHwValveOn = !setChValveOn;
+    }
+    else if (sNow > lastEndShutdown + configArr[anticycleOnOnIx].value)
+    {
+      // can enter new shutdown cycle
+      // dump heat cycle - either to CH if Tado > off or to CH
+      controlState = CONTROLSSHUTDOWN;
+      setChValveOn = chDumpOk;
+      setHwValveOn = !setChValveOn;
+      setBoilerOff = true;
     }
   }
   else
   {
     // there is demand 
-    breakShutdownCycle = false;
     setChValveOn = false;
     setHwValveOn = false;
 
@@ -1347,26 +1495,33 @@ void calculate()
         controlState = CONTROLSHEATING;
       }
     }
+
+    // can piggy back HW?
+    if (chDemand && hwPiggyback)
+    {
+      setHwValveOn = true;
+    }
+   
     // click hw pump on at onTemp - off at same - hysteresis
-    if (!hwDemand)
-    {
-      setHwPumpOn = false;
-    }
-    else if (!setHwPumpOn)
-    {
-      if (adjustedBoilerTemp >= boilerOnTemp)
-      {
-        setHwPumpOn = true;
-      }
-    }
-    else
-    {
-      if (adjustedBoilerTemp < boilerOnTemp - configArr[hwPumpHystIx].value)
-      {
-        setHwPumpOn = false;
-      }
-    }
-    setHwPumpOn = false;    // disable for now
+  //  if (!hwDemand)
+  //  {
+  //    setHwPumpOn = false;
+  //  }
+  //  else if (!setHwPumpOn)
+  //  {
+  //    if (adjustedBoilerTemp >= boilerOnTemp)
+  //    {
+  //      setHwPumpOn = true;
+  //    }
+  //  }
+  //  else
+  //  {
+     // if (adjustedBoilerTemp < boilerOnTemp - configArr[hwPumpHystIx].value)
+     // {
+     //   setHwPumpOn = false;
+     // }
+  //  }
+    //setHwPumpOn = false;    // disable for now
   }
 
   if (!logged && controlState != prevControlState)
@@ -1388,6 +1543,7 @@ void lcdReInit()
   }
 }
 
+/*
 void readInputs()
 {
   lastInputs = PCF_01.read8();
@@ -1404,13 +1560,14 @@ void readInputs()
     tempLowLimit = !bitRead(lastInputs, TEMPLOLIMBIT);
   }
 }
+*/
 
 // assumes we have last state in lastInputs
 // only change one at a time
 
 void setOutputs()
 {
-  byte existB = READMASK | lastInputs;
+  byte existB = PCF_01.read8();
   byte newB = setOutputs2(existB);
   if (newB != existB)
   {
@@ -1440,12 +1597,12 @@ byte setOutputs2(byte existB)
     log("HWVALVE > " + onOffS(setHwValveOn));
     return newB;
   }
-  bitWrite(newB, HWPUMPBIT,  !setHwPumpOn);
-  if (newB != existB)
-  {
-    log("HWPUMP > " + onOffS(setHwPumpOn));
-    return newB;
-  }
+  //bitWrite(newB, HWPUMPBIT,  !setHwPumpOn);
+  //if (newB != existB)
+  //{
+  //  log("HWPUMP > " + onOffS(setHwPumpOn));
+  //  return newB;
+  //}
   if (sNow < boilerOffDelayUntil && !setBoilerOff)
   {
     return newB;      // don't release yet! 
@@ -1527,6 +1684,7 @@ void dohelp()
   cmdlog("mnn - change sensor ud");
   cmdlog("d - diagnostics");
   cmdlog("t - sendstatus");
+  cmdlog("q - simulation secial");
 }
 
 void parseCmd()
@@ -1537,6 +1695,10 @@ void parseCmd()
     case '?':
     case 'h':
       dohelp();
+      break;
+
+    case 'q':
+      handleSim();
       break;
     
     case 'c':
@@ -1611,6 +1773,7 @@ void parseCmd()
   }
   bPtr=0;  // reset buffer pointer
 }
+
 
 void handleConfig()
 {
@@ -1829,7 +1992,7 @@ void loop()
     // 1 sec processing
     getTemperatures();
     selfTest();
-    readInputs();
+    //!readInputs();
     readTadoAnalog();
     readHWTemp(); 
     calculate();
